@@ -1,0 +1,7 @@
+{"a":"Explain vector databases.","b":"Can you explain what vector databases are?","match":true}
+{"a":"What is the capital of France?","b":"Which city is the capital of France?","match":true}
+{"a":"How do I reverse a string in Python?","b":"Python: reverse a string, how?","match":true}
+{"a":"What is the capital of France?","b":"What is the capital of Germany?","match":false}
+{"a":"Summarize the causes of World War I.","b":"Summarize the causes of World War II.","match":false}
+{"a":"How do I reverse a string in Python?","b":"How do I reverse a linked list in Python?","match":false}
+{"a":"Write a haiku about autumn.","b":"Write a haiku about spring.","match":false}

@@ -1,0 +1,8 @@
+{
+  "_note": "Prices are USD per 1,000,000 tokens and are NOT bundled for real providers: provider pricing changes, so fill in current values from each provider's pricing page. Missing entries yield estimated_cost = null (never a guess). Lookup order: '<provider>:<model>' then '*:<model>'. The mock entry is ILLUSTRATIVE ONLY so cost charts work in demos.",
+  "currency": "USD",
+  "unit": "per_1M_tokens",
+  "prices": {
+    "*:mock-model": { "input": 0.10, "output": 0.20 }
+  }
+}

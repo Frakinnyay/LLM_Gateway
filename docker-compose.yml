@@ -1,0 +1,75 @@
+# Full local stack:  npm run setup  &&  docker compose up --build
+#   dashboard http://localhost:8081   gateway http://localhost:8080
+# Requires a .env file (npm run setup generates one with random secrets). All published ports bind to 127.0.0.1 only.
+name: llm-gateway
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway} # local default; set a strong value for anything non-local
+      POSTGRES_DB: llm_gateway
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d llm_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # Cache/rate-limit data is disposable: no persistence; bounded memory; only TTL'd keys are evictable.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["node", "dist/scripts/migrate.js"]
+    env_file: .env
+    environment: &infra
+      NODE_ENV: production
+      DATABASE_URL: postgres://gateway:${POSTGRES_PASSWORD:-gateway}@postgres:5432/llm_gateway
+      REDIS_URL: redis://redis:6379
+      API_KEY_PEPPER: ${API_KEY_PEPPER:?run `npm run setup` to create .env}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?run `npm run setup` to create .env}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  gateway:
+    build: .
+    env_file: .env
+    environment: *infra
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 15s # lets in-flight requests and the request-log queue drain on SIGTERM
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    ports: ["127.0.0.1:8081:8080"]
+    depends_on:
+      gateway: { condition: service_healthy }
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  pgdata:
