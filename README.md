@@ -2,7 +2,7 @@
 
 An **OpenAI-compatible gateway** that sits between your applications and multiple LLM providers (Groq, Gemini, OpenRouter, plus built-in mock providers) and adds authentication, rate limiting, token budgets, exact + semantic caching, provider fallback with circuit breakers, SSE streaming, asynchronous logging and Prometheus metrics. It runs **entirely locally at zero cost**; real provider API keys are optional.
 
-> **Read this first — verification status.** The code, tests, Docker setup, CI and docs are written, The core system is verified (see the table in section 19); real providers, benchmarks and the optional pieces are not yet.
+> **Status:** the core system is **verified** — 96 unit tests, 85 integration tests against real PostgreSQL/pgvector and Redis, the full Docker stack, an end-to-end smoke test and GitHub Actions CI all pass (details in [section 19](#19-current-verification-status)). Real LLM providers, a neural embedder and gateway-overhead/throughput benchmarks have **not** been exercised yet; those are marked as such below. Benchmark numbers in [section 14](#14-benchmark-methodology-and-results) were measured by the author on one machine with mock providers and a synthetic workload — read the conditions before quoting them.
 
 ## 1. What problem this solves
 Applications that call LLM providers directly each re-implement keys, retries, rate limits, cost control and failover — and still go down when one provider does. A gateway centralises that: one OpenAI-style endpoint, per-tenant keys/limits/budgets, caching to avoid paying twice for the same answer, automatic failover when a provider fails, and one place to observe usage and cost.
@@ -53,6 +53,7 @@ npm run dev                # gateway on http://localhost:8080
 npm run create-tenant -- demo      # prints a tenant API key ONCE
 npm run dev:dashboard      # dashboard on http://localhost:5173 (sign in with ADMIN_API_TOKEN from .env)
 ```
+> **Windows tip:** if Docker reports `ports are not available ... forbidden by its access permissions` for port 5432, Windows has reserved that port. Add `POSTGRES_PORT=5433` to `.env`, change the port inside `DATABASE_URL` to `5433`, then run `npm run infra:down` and `npm run infra:up` (same idea for `REDIS_PORT`).
 
 ## 7. Environment variables
 Every variable, its default and meaning: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) (generated from the validated schema; `.env.example` is the template). Essentials:
@@ -106,16 +107,48 @@ Unit tests cover keys, circuit breaker, provider manager, SSE parser, cache keys
 ## 13. Load testing
 k6 scripts in `load-tests/` (`gateway.js` overhead, `cache.js` hit rates/cost, `fallback.js` failure recovery), a deterministic upstream stub (`scripts/mock-upstream.js`) and a dataset generator. Procedure: [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md).
 
-## 14. Benchmark methodology
-Four benchmarks — cache hit rate, gateway overhead (client→upstream vs client→gateway→upstream against the *same* deterministic upstream, open-model arrival rate), estimated cost with vs without cache, and provider failure recovery — with explicit caveats in the load-testing doc. **Results (all not yet measured):**
+## 14. Benchmark methodology and results
 
-| Metric | Value |
+Procedure and scripts: [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md) (k6, a deterministic upstream stub, a seeded dataset generator). **Conditions for every number below:** measured by the author on one Windows PC (Docker Desktop, 12 CPUs available to Docker, Node v24), with the built-in **mock providers** and the built-in **lexical (hash) embedder**, a **fresh tenant per run**, rate limits raised so they did not interfere. Prices come from the project's **illustrative** mock price (about $0.10 / $0.20 per million input/output tokens), so only the *percentages* are meaningful, not the dollar amounts. These are single runs on a synthetic workload, not a statistical study.
+
+### Cache hit rate and cost (500-request synthetic workload: 40% new, 27% exact repeats, 33% paraphrases, semantic threshold 0.92)
+
+| Metric | Result |
 |---|---|
-| Cache hit rate | TBD |
-| p95 gateway overhead | TBD |
-| Estimated cost savings | TBD |
-| Fallback recovery rate | TBD |
-| Throughput | TBD |
+| Overall cache hit rate | **30.6%** (153 of 500) |
+| Exact repeats served from cache | 136 of 136 (**100%**) |
+| Never-seen prompts answered from cache (false hits) | 0 of 200 |
+| Semantic hits | **0** — the lexical embedder scored real paraphrases below the 0.92 threshold |
+| Estimated cost without cache → with cache | $0.0018259 → $0.0013202 (illustrative pricing) |
+| **Estimated cost reduction** | **27.7%** |
+
+The hit rate depends on the workload mix as much as on the gateway; always quote it with the mix above.
+
+### Semantic-threshold experiment (same workload, fresh tenant per threshold)
+
+"Correct" = the cached answer belonged to the same topic (checked using the mock provider's echoed prompt; exact hits are correct by definition).
+
+| Threshold | Reported hit rate | Correct hit rate | Wrong answers served | Share of semantic hits that were wrong |
+|---|---|---|---|---|
+| 0.92 | 30.6% | 30.6% | 0 | no semantic hits |
+| 0.85 | 36.4% | **34.6%** | 9 (1.8%) | 28% |
+| 0.75 | 67.4% | 31.6% | 179 (35.8%) | 75% |
+| 0.65 | 85.0% | 28.4% | 283 (56.6%) | 82% |
+
+**Finding:** lowering the threshold made the reported hit rate look much better while the *correct* hit rate fell and wrong answers rose; with this embedder there is no threshold that is both useful and safe, so the default stays conservative (0.92) and semantic caching should be enabled with a neural embedder and a threshold tuned on labelled pairs (`npm run threshold-sweep`). Limits: synthetic, template-heavy prompts; the correctness check depends on the mock provider echoing the prompt; results with a neural embedder or real traffic will differ.
+
+### Provider failure and recovery (primary mock provider returning HTTP 503, 20 requests/s)
+
+| Metric | Result |
+|---|---|
+| Requests during a 30 s outage | 601 attempted, **601 served via the fallback provider, 0 failed** |
+| Requests during a 10 s outage | 200 attempted, 200 served via fallback, 0 failed |
+| Time until the primary served traffic again after it healed | **20.64 s** in the 10 s run (breaker cooldown is 30 s, 10 s had already elapsed); 0.66 s in the 30 s run (cooldown almost over) |
+
+Recovery after healing is bounded by the circuit-breaker cooldown (`CB_COOLDOWN_MS`, default 30 s). Request latency during these runs (~70 ms) includes the mock provider's built-in 50 ms delay and is **not** a gateway-overhead measurement.
+
+### Not measured
+Gateway-added latency (p50/p95/p99), maximum sustained throughput, behaviour with real providers, and results with a neural embedder. The k6 procedure for gateway overhead is in `docs/LOAD_TESTING.md` if you want to measure it.
 
 ## 15. Dogfooding
 Point existing OpenAI-compatible apps at `http://localhost:8080/v1`: [docs/DOGFOODING.md](docs/DOGFOODING.md). Note what it does **not** do: no `/v1/embeddings`, no tool/function calling or JSON mode (rejected with a clear 400).
@@ -131,22 +164,30 @@ Why PostgreSQL/pgvector/Redis, token bucket + Lua, two cache levels, provider ab
 
 ## 19. Current verification status
 
-Legend: **IMPLEMENTED** = code/doc written · **VERIFIED** = actually executed, with what was executed · **UNVERIFIED** = written but never run.
+Legend: **IMPLEMENTED** = written · **VERIFIED** = actually executed (what was run is stated) · **UNVERIFIED / NOT RUN** = never executed.
 
 | Area | Status | Detail |
 |---|---|---|
-| Source for all phases | IMPLEMENTED | — |
-| `npm install`, typecheck (gateway + dashboard), ESLint, `vite build` | **VERIFIED** | Run on Windows with Node v24 and in GitHub Actions. |
-| Unit tests (96) | **VERIFIED** | `npm test`: 12 suites, 96 tests passing. |
-| Integration tests (85, incl. concurrency tests) | **VERIFIED** | `npm run test:integration` against real PostgreSQL/pgvector and Redis in Docker: 85/85 passing. Two flawed tests were found and fixed (shared circuit-breaker state, a timing assumption). |
-| Manual end-to-end demos | **VERIFIED** | Exact cache, semantic cache (similarity 1.0000 hit, 0.8740 miss), failover, circuit breaker open/recover, streaming, mid-stream failure, rate limit 429 + refill, metrics. |
-| Docker: build, `docker compose up --build`, nginx proxy, healthchecks, `npm run smoke` (12/12) | **VERIFIED** | Dashboard streaming through nginx works. |
-| GitHub Actions CI (quality, integration, docker jobs) | **VERIFIED** | First run green. |
-| Real providers (Groq/Gemini/OpenRouter), `transformers` embedder, streaming usage option | UNVERIFIED | Never called. |
-| k6 scripts and all benchmarks | **NOT RUN** | Values remain `TBD` until measured. |
-| `scripts/verify.sh`, `scripts/verify.ps1` | UNVERIFIED | Only the logic was tested with stubs. |
-| AWS deployment | **NOT DONE** | Documentation only. |
-**Recommended first steps on your machine:** `npm install` (commit the lockfile) → `npm run lint && npm run typecheck && npm test` → `npm run infra:up && npm run test:integration` → `docker compose up --build && npm run smoke` → fix anything that surfaces → run the benchmarks → then fill in the `TBD` values with your own measurements.
+| Source for all components (gateway, packages, dashboard, migrations, Docker, CI, scripts, docs) | IMPLEMENTED | — |
+| Install, typecheck (gateway + dashboard), ESLint, production builds (`tsc`, `vite build`) | **VERIFIED** | Windows, Node v24, and GitHub Actions. |
+| Unit tests | **VERIFIED** | 12 suites, 96 tests passing (`npm test`). |
+| Integration tests incl. concurrency tests | **VERIFIED** | 9 suites, 85 tests passing against real PostgreSQL + pgvector and Redis in Docker. Running them exposed two flawed tests (leaked circuit-breaker state; a timing assumption) and one leaked timer — all fixed. |
+| Live demos (dashboard) | **VERIFIED** | Exact cache, semantic cache (similarity 1.0000 hit; 0.8740 miss at threshold 0.92), failover, circuit breaker open/recover, streaming, mid-stream failure, rate limit 429 + refill, metrics. |
+| Docker: build, `docker compose up`, nginx proxy (including streaming), healthchecks, `npm run smoke` | **VERIFIED** | 4 services healthy; smoke test 12/12. |
+| GitHub Actions CI | **VERIFIED** | All three jobs (quality, integration, docker) green. |
+| Benchmarks: cache hit rate, cost reduction, threshold experiment, failover/recovery | **VERIFIED** | Section 14 (single runs, mock providers, synthetic workload). |
+| Real providers (Groq / Gemini / OpenRouter), `STREAM_INCLUDE_USAGE`, `transformers` embedder | UNVERIFIED | Never called. |
+| Gateway overhead and throughput benchmarks | **NOT RUN** | Procedure in `docs/LOAD_TESTING.md`. |
+| `scripts/verify.sh`, `scripts/verify.ps1` | UNVERIFIED | Only the pass/fail logic was exercised with stubbed commands. |
+| AWS deployment | **NOT DONE** | Documentation only (`docs/AWS_DEPLOYMENT.md`). |
+
+## 20. Known limitations
+
+* **Cross-vendor failover is not practical yet:** the model name is forwarded to the provider unchanged and vendors name models differently, so failover works between providers that accept the same ID (e.g. the mock providers). A model-alias mapping is the main recommended enhancement.
+* **Semantic cache quality:** the built-in embedder is lexical; the threshold experiment shows it cannot separate paraphrases from different topics. Use a neural embedder (optional) and tune on labelled data before enabling it for real traffic.
+* **Not implemented:** `/v1/embeddings`, tool/function calling, JSON mode (rejected with a clear 400), multimodal input.
+* **Security/ops gaps (see `docs/SECURITY_AUDIT.md`):** a single static admin token, no auth-failure throttling, prompts/responses cached in plaintext until TTL, no log retention, the gateway does not terminate TLS.
+* **Per-process state:** circuit-breaker state and runtime provider toggles are not shared across gateway instances.
 
 ## License
-MIT (add a `LICENSE` file before publishing).
+MIT — see the `LICENSE` file.
